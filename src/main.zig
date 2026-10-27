@@ -17,7 +17,9 @@ const LineStats = struct {
 
 const hbar: []const u8 = "\xe2\x94\x80"; // U+2500, 3 bytes
 const prefix: []const u8 = "\xe2\x94\x80 "; // "─ " = 4 bytes
-const footer: []const u8 = "───────────────────────\n";
+
+const merge_files_threshold: usize = 20;
+const merge_folder_threshold: usize = 7;
 
 fn formatLine(buf: []u8, item: StatusItem, stats: LineStats) []u8 {
     var offset: usize = 0;
@@ -42,14 +44,33 @@ fn formatLine(buf: []u8, item: StatusItem, stats: LineStats) []u8 {
     return buf[0..offset];
 }
 
-fn formatFooter(buf: []u8, changes: usize, untracked_count: usize) []u8 {
-    if (changes > 0 and untracked_count > 0) {
-        return std.fmt.bufPrint(buf, "  {d} changes · {d} untracked\n", .{ changes, untracked_count }) catch buf[0..0];
-    } else if (changes > 0) {
-        return std.fmt.bufPrint(buf, "  {d} changes\n", .{changes}) catch buf[0..0];
-    } else {
-        return std.fmt.bufPrint(buf, "  {d} untracked\n", .{untracked_count}) catch buf[0..0];
+fn folderOf(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| return path[0..idx];
+    return "";
+}
+
+fn formatFolderLine(buf: []u8, item: StatusItem, folder: []const u8, count: usize, stats: LineStats) []u8 {
+    var offset: usize = 0;
+
+    const printed = std.fmt.bufPrint(buf[offset..], "  {c}{c} {s}/...({d} files)", .{
+        item.index,
+        item.worktree,
+        folder,
+        count,
+    }) catch unreachable;
+    offset += printed.len;
+
+    if (stats.added > 0 or stats.removed > 0) {
+        const extra = std.fmt.bufPrint(buf[offset..], " +{} -{}", .{
+            stats.added, stats.removed,
+        }) catch unreachable;
+        offset += extra.len;
     }
+
+    buf[offset] = '\n';
+    offset += 1;
+
+    return buf[0..offset];
 }
 
 fn getFolderName(allocator: Allocator, io: std.Io) []const u8 {
@@ -339,7 +360,6 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(branch);
 
     var line_buf: [512]u8 = undefined;
-    var footer_buf: [512]u8 = undefined;
     var header_buf: [256]u8 = undefined;
 
     while (true) {
@@ -366,15 +386,16 @@ pub fn main(init: std.process.Init) !void {
         var total_added: usize = 0;
         var total_removed: usize = 0;
         var total_changed: usize = 0;
-        var staged_count: usize = 0;
-        var modified_count: usize = 0;
-        var untracked_count: usize = 0;
 
-        for (items) |item| {
+        const item_stats_list = try allocator.alloc(LineStats, items.len);
+        defer allocator.free(item_stats_list);
+
+        for (items, 0..) |item, idx| {
             const item_stats = switch (item.path[0]) {
                 '?' => LineStats{ .added = 0, .removed = 0 },
                 else => getLineChanges(allocator, item.path, io),
             };
+            item_stats_list[idx] = item_stats;
 
             total_added += item_stats.added;
             total_removed += item_stats.removed;
@@ -385,10 +406,6 @@ pub fn main(init: std.process.Init) !void {
                     total_changed += item_stats.removed;
                 }
             }
-
-            if (item.index != ' ' and item.index != '?') staged_count += 1;
-            if (item.index == ' ' and item.worktree != ' ') modified_count += 1;
-            if (item.index == '?') untracked_count += 1;
         }
 
         // Build stats text: "+A ~C -R"
@@ -505,28 +522,46 @@ pub fn main(init: std.process.Init) !void {
         writeOut(io, header_buf[0..header_buf.len]) catch {};
 
         // Print file lines (second pass).
-        for (items) |item| {
-            const item_stats = switch (item.path[0]) {
-                '?' => LineStats{ .added = 0, .removed = 0 },
-                else => getLineChanges(allocator, item.path, io),
-            };
-            const line = formatLine(&line_buf, item, item_stats);
-            writeOut(io, line) catch {};
-        }
+        if (items.len > merge_files_threshold) {
+            const handled = try allocator.alloc(bool, items.len);
+            defer allocator.free(handled);
+            @memset(handled, false);
 
-        // Footer: total changes summary
-        if (items.len == 0) {
-            const ftr = try std.fmt.bufPrint(&footer_buf, "  working tree clean\n", .{});
-            writeOut(io, ftr) catch {};
+            for (items, 0..) |item, idx| {
+                if (handled[idx]) continue;
+
+                const dir = folderOf(item.path);
+                var count: usize = 0;
+                var folder_stats = LineStats{ .added = 0, .removed = 0 };
+                for (items, 0..) |other, other_idx| {
+                    if (handled[other_idx]) continue;
+                    if (!std.mem.eql(u8, folderOf(other.path), dir)) continue;
+
+                    count += 1;
+                    folder_stats.added += item_stats_list[other_idx].added;
+                    folder_stats.removed += item_stats_list[other_idx].removed;
+                }
+
+                if (dir.len > 0 and count > merge_folder_threshold) {
+                    for (items, 0..) |other, other_idx| {
+                        if (!handled[other_idx] and std.mem.eql(u8, folderOf(other.path), dir)) {
+                            handled[other_idx] = true;
+                        }
+                    }
+                    const line = formatFolderLine(&line_buf, item, dir, count, folder_stats);
+                    writeOut(io, line) catch {};
+                } else {
+                    handled[idx] = true;
+                    const line = formatLine(&line_buf, item, item_stats_list[idx]);
+                    writeOut(io, line) catch {};
+                }
+            }
         } else {
-            const changes = staged_count + modified_count;
-            const ftr = formatFooter(&footer_buf, changes, untracked_count);
-            writeOut(io, ftr) catch {};
+            for (items, 0..) |item, idx| {
+                const line = formatLine(&line_buf, item, item_stats_list[idx]);
+                writeOut(io, line) catch {};
+            }
         }
-
-        // Bottom border
-        const bottom = "───────────────────────\n";
-        writeOut(io, bottom) catch {};
 
         allocator.free(status_raw);
         for (items) |item| allocator.free(item.path);
