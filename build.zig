@@ -1,0 +1,1 @@
+// Intentionally empty. Use `zig build-exe` directly.
