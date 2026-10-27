@@ -17,23 +17,48 @@ const LineStats = struct {
 
 const hbar: []const u8 = "\xe2\x94\x80"; // U+2500, 3 bytes
 const prefix: []const u8 = "\xe2\x94\x80 "; // "─ " = 4 bytes
+const separator: []const u8 = " \xc2\xb7 "; // " · "
+
+const ansi_reset: []const u8 = "\x1b[0m";
+const ansi_dim: []const u8 = "\x1b[2m";
+const ansi_red: []const u8 = "\x1b[31m";
+const ansi_green: []const u8 = "\x1b[32m";
+const ansi_yellow: []const u8 = "\x1b[33m";
+const ansi_magenta: []const u8 = "\x1b[1;35m";
+const ansi_bold_cyan: []const u8 = "\x1b[1;36m";
 
 const merge_files_threshold: usize = 20;
 const merge_folder_threshold: usize = 7;
 
+fn statusColor(item: StatusItem) []const u8 {
+    if (item.index == '?' or item.index == 'U' or item.worktree == 'U') return ansi_red;
+    if (item.index == 'D' or item.worktree == 'D') return ansi_red;
+    if (item.index != ' ' and item.index != '?') return ansi_green;
+    if (item.worktree != ' ') return ansi_yellow;
+    return ansi_dim;
+}
+
 fn formatLine(buf: []u8, item: StatusItem, stats: LineStats) []u8 {
     var offset: usize = 0;
 
-    const printed = std.fmt.bufPrint(buf[offset..], "  {c}{c} {s}", .{
+    const printed = std.fmt.bufPrint(buf[offset..], "  {s}{c}{c}{s} {s}", .{
+        statusColor(item),
         item.index,
         item.worktree,
+        ansi_reset,
         item.path,
     }) catch unreachable;
     offset += printed.len;
 
-    if (stats.added > 0 or stats.removed > 0) {
-        const extra = std.fmt.bufPrint(buf[offset..], " +{} -{}", .{
-            stats.added, stats.removed,
+    if (stats.added > 0) {
+        const extra = std.fmt.bufPrint(buf[offset..], " {s}+{d}{s}", .{
+            ansi_green, stats.added, ansi_reset,
+        }) catch unreachable;
+        offset += extra.len;
+    }
+    if (stats.removed > 0) {
+        const extra = std.fmt.bufPrint(buf[offset..], " {s}-{d}{s}", .{
+            ansi_red, stats.removed, ansi_reset,
         }) catch unreachable;
         offset += extra.len;
     }
@@ -52,17 +77,29 @@ fn folderOf(path: []const u8) []const u8 {
 fn formatFolderLine(buf: []u8, item: StatusItem, folder: []const u8, count: usize, stats: LineStats) []u8 {
     var offset: usize = 0;
 
-    const printed = std.fmt.bufPrint(buf[offset..], "  {c}{c} {s}/...({d} files)", .{
+    const printed = std.fmt.bufPrint(buf[offset..], "  {s}{c}{c}{s} {s}{s}{s}{s}/...({d} files){s}", .{
+        statusColor(item),
         item.index,
         item.worktree,
+        ansi_reset,
+        ansi_bold_cyan,
         folder,
+        ansi_reset,
+        ansi_dim,
         count,
+        ansi_reset,
     }) catch unreachable;
     offset += printed.len;
 
-    if (stats.added > 0 or stats.removed > 0) {
-        const extra = std.fmt.bufPrint(buf[offset..], " +{} -{}", .{
-            stats.added, stats.removed,
+    if (stats.added > 0) {
+        const extra = std.fmt.bufPrint(buf[offset..], " {s}+{d}{s}", .{
+            ansi_green, stats.added, ansi_reset,
+        }) catch unreachable;
+        offset += extra.len;
+    }
+    if (stats.removed > 0) {
+        const extra = std.fmt.bufPrint(buf[offset..], " {s}-{d}{s}", .{
+            ansi_red, stats.removed, ansi_reset,
         }) catch unreachable;
         offset += extra.len;
     }
@@ -234,7 +271,7 @@ fn writeOut(io: std.Io, buf: []const u8) !void {
 // Fit "folder · branch · stats" into max_content bytes, truncating the branch
 // (and dropping the stats if there is no room) so the header always fits.
 fn truncateBranch(buf: []u8, folder: []const u8, branch: []const u8, stats: []const u8, stats_len: usize, max_content: usize) usize {
-    const sep = " · ";
+    const sep = separator;
     const stats_slice = stats[0..stats_len];
     const limit = @min(max_content, buf.len);
 
@@ -279,35 +316,127 @@ fn truncateBranch(buf: []u8, folder: []const u8, branch: []const u8, stats: []co
     return out;
 }
 
-// Write header line: "─ " + content + "─" fill + "\n"
-// prefix = 4 bytes ("─ " = U+2500 + space)
-// fill = 3 bytes per "─" character
-// newline = 1 byte. Buffer must be (4 + newline + fill) divisible by 3.
-fn writeHeaderLine(buf: []u8, content: []const u8) void {
+fn appendStr(buf: []u8, offset: *usize, s: []const u8) void {
+    @memcpy(buf[offset.*..][0..s.len], s);
+    offset.* += s.len;
+}
+
+fn appendStatsColored(buf: []u8, offset: *usize, stats: []const u8) void {
+    var it = std.mem.splitScalar(u8, stats, ' ');
+    var first = true;
+    while (it.next()) |token| {
+        if (token.len == 0) continue;
+        if (!first) appendStr(buf, offset, " ");
+        first = false;
+
+        const color = switch (token[0]) {
+            '+' => ansi_green,
+            '~' => ansi_yellow,
+            '-' => ansi_red,
+            else => ansi_dim,
+        };
+        appendStr(buf, offset, color);
+        appendStr(buf, offset, token);
+        appendStr(buf, offset, ansi_reset);
+    }
+}
+
+// Write header line: dim "─ " prefix + colored content + dim "─" fill + "\n".
+// Folder is cyan, branch magenta, and stats are green/yellow/red.
+// The returned slice contains ANSI escape codes, so it is longer than `width`.
+fn writeHeaderLine(buf: []u8, content: []const u8, folder: []const u8, stats: []const u8, stats_len: usize, width: usize) usize {
     var offset: usize = 0;
+    var used: usize = 0;
 
-    // "─ " prefix (4 bytes)
-    std.mem.copyForwards(u8, buf[offset..], prefix);
-    offset += prefix.len;
+    appendStr(buf, &offset, ansi_dim);
+    appendStr(buf, &offset, prefix);
+    used += 2;
+    appendStr(buf, &offset, ansi_reset);
 
-    // Content (ASCII, 1 byte per char, up to full buffer minus prefix and newline).
-    var c = content;
-    const max_clen = buf.len - prefix.len - 1;
-    var clen: usize = 0;
-    while (clen < max_clen and c.len > 0) : (clen += 1) {
-        buf[offset] = c[0];
-        offset += 1;
-        c = c[1..];
+    const folder_len = @min(folder.len, content.len);
+    appendStr(buf, &offset, ansi_bold_cyan);
+    appendStr(buf, &offset, content[0..folder_len]);
+    appendStr(buf, &offset, ansi_reset);
+    used += folder_len;
+
+    const rest = content[folder_len..];
+    if (rest.len > 0 and std.mem.startsWith(u8, rest, separator)) {
+        const body = rest[separator.len..];
+
+        const stats_slice = stats[0..stats_len];
+        var branch = body;
+        var has_stats = false;
+
+        if (stats_slice.len > 0) {
+            const stats_seg_len = separator.len + stats_slice.len;
+            if (body.len == stats_slice.len and std.mem.eql(u8, body, stats_slice)) {
+                branch = body[0..0];
+                has_stats = true;
+            } else if (body.len >= stats_seg_len) {
+                const tail = body[body.len - stats_seg_len ..];
+                if (std.mem.eql(u8, tail[0..separator.len], separator) and
+                    std.mem.eql(u8, tail[separator.len..], stats_slice))
+                {
+                    branch = body[0 .. body.len - stats_seg_len];
+                    has_stats = true;
+                }
+            }
+        }
+
+        if (branch.len > 0) {
+            appendStr(buf, &offset, ansi_dim);
+            appendStr(buf, &offset, separator);
+            appendStr(buf, &offset, ansi_reset);
+            used += 3;
+
+            appendStr(buf, &offset, ansi_magenta);
+            appendStr(buf, &offset, branch);
+            appendStr(buf, &offset, ansi_reset);
+            used += branch.len;
+
+            if (has_stats) {
+                appendStr(buf, &offset, ansi_dim);
+                appendStr(buf, &offset, separator);
+                appendStr(buf, &offset, ansi_reset);
+                used += 3;
+
+                appendStatsColored(buf, &offset, stats_slice);
+                used += stats_slice.len;
+            }
+        } else if (has_stats) {
+            appendStr(buf, &offset, ansi_dim);
+            appendStr(buf, &offset, separator);
+            appendStr(buf, &offset, ansi_reset);
+            used += 3;
+
+            appendStatsColored(buf, &offset, stats_slice);
+            used += stats_slice.len;
+        } else if (body.len > 0) {
+            appendStr(buf, &offset, ansi_dim);
+            appendStr(buf, &offset, rest);
+            appendStr(buf, &offset, ansi_reset);
+            used += 3 + body.len;
+        }
+    } else {
+        appendStr(buf, &offset, ansi_bold_cyan);
+        appendStr(buf, &offset, rest);
+        appendStr(buf, &offset, ansi_reset);
+        used += rest.len;
     }
 
-    // Fill with "─" (3 bytes each) until newline position.
-    // Skip partial bars that would not complete.
-    const nl_pos = buf.len - 1;
-    while (offset + hbar.len <= nl_pos) : (offset += hbar.len) {
-        std.mem.copyForwards(u8, buf[offset..], hbar);
+    appendStr(buf, &offset, ansi_dim);
+
+    const line_width = @max(width, 6);
+    while (used < line_width and offset + hbar.len + 1 + ansi_reset.len <= buf.len) : (used += 1) {
+        appendStr(buf, &offset, hbar);
     }
-    // Newline goes right after the last complete bar (not at buffer end)
+
+    appendStr(buf, &offset, ansi_reset);
+
     buf[offset] = '\n';
+    offset += 1;
+
+    return offset;
 }
 
 // Zig 0.16.0 entry point
@@ -360,7 +489,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(branch);
 
     var line_buf: [512]u8 = undefined;
-    var header_buf: [256]u8 = undefined;
+    var header_buf: [1024]u8 = undefined;
 
     while (true) {
         // Clear screen for TTY
@@ -414,6 +543,10 @@ pub fn main(init: std.process.Init) !void {
         var num_buf: [16]u8 = undefined;
         if (total_added > 0) {
             const s = std.fmt.bufPrint(&num_buf, "{d}", .{total_added}) catch unreachable;
+            if (stats_len > 0) {
+                stats_buf[stats_len] = ' ';
+                stats_len += 1;
+            }
             stats_buf[stats_len] = '+';
             stats_len += 1;
             var n = s;
@@ -424,6 +557,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (total_changed > 0) {
             const s = std.fmt.bufPrint(&num_buf, "{d}", .{total_changed}) catch unreachable;
+            if (stats_len > 0) {
+                stats_buf[stats_len] = ' ';
+                stats_len += 1;
+            }
             stats_buf[stats_len] = '~';
             stats_len += 1;
             var n = s;
@@ -434,6 +571,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (total_removed > 0) {
             const s = std.fmt.bufPrint(&num_buf, "{d}", .{total_removed}) catch unreachable;
+            if (stats_len > 0) {
+                stats_buf[stats_len] = ' ';
+                stats_len += 1;
+            }
             stats_buf[stats_len] = '-';
             stats_len += 1;
             var n = s;
@@ -455,24 +596,16 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (branch.len > 0 and has_stats) {
-            content_buf[content_len] = ' ';
-            content_len += 1;
-            content_buf[content_len] = '·';
-            content_len += 1;
-            content_buf[content_len] = ' ';
-            content_len += 1;
+            std.mem.copyForwards(u8, content_buf[content_len..], separator);
+            content_len += separator.len;
 
             var b = branch;
             while (b.len > 0) : (b = b[1..]) {
                 content_buf[content_len] = b[0];
                 content_len += 1;
             }
-            content_buf[content_len] = ' ';
-            content_len += 1;
-            content_buf[content_len] = '·';
-            content_len += 1;
-            content_buf[content_len] = ' ';
-            content_len += 1;
+            std.mem.copyForwards(u8, content_buf[content_len..], separator);
+            content_len += separator.len;
 
             var s = stats_buf[0..stats_len];
             while (s.len > 0) : (s = s[1..]) {
@@ -480,12 +613,8 @@ pub fn main(init: std.process.Init) !void {
                 content_len += 1;
             }
         } else if (branch.len > 0) {
-            content_buf[content_len] = ' ';
-            content_len += 1;
-            content_buf[content_len] = '·';
-            content_len += 1;
-            content_buf[content_len] = ' ';
-            content_len += 1;
+            std.mem.copyForwards(u8, content_buf[content_len..], separator);
+            content_len += separator.len;
 
             var b = branch;
             while (b.len > 0) : (b = b[1..]) {
@@ -493,12 +622,8 @@ pub fn main(init: std.process.Init) !void {
                 content_len += 1;
             }
         } else if (has_stats) {
-            content_buf[content_len] = ' ';
-            content_len += 1;
-            content_buf[content_len] = '·';
-            content_len += 1;
-            content_buf[content_len] = ' ';
-            content_len += 1;
+            std.mem.copyForwards(u8, content_buf[content_len..], separator);
+            content_len += separator.len;
 
             var s = stats_buf[0..stats_len];
             while (s.len > 0) : (s = s[1..]) {
@@ -510,7 +635,7 @@ pub fn main(init: std.process.Init) !void {
         // Get terminal width and compute truncation.
         const term_width = getTerminalWidth();
         const max_content = if (term_width > 4) term_width - 4 else 23;
-        const header_len = if (content_len <= max_content) content_len else truncateBranch(
+        const header_content_len = if (content_len <= max_content) content_len else truncateBranch(
             &content_buf,
             folder,
             branch,
@@ -518,8 +643,8 @@ pub fn main(init: std.process.Init) !void {
             stats_len,
             max_content,
         );
-        writeHeaderLine(&header_buf, content_buf[0..header_len]);
-        writeOut(io, header_buf[0..header_buf.len]) catch {};
+        const header_len = writeHeaderLine(&header_buf, content_buf[0..header_content_len], folder, &stats_buf, stats_len, term_width);
+        writeOut(io, header_buf[0..header_len]) catch {};
 
         // Print file lines (second pass).
         if (items.len > merge_files_threshold) {
