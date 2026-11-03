@@ -1,8 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-
-const Version = struct { major: u32, minor: u32, patch: u32 };
-const version: Version = .{ .major = 0, .minor = 1, .patch = 0 };
+const version = @import("version.zig").version;
 
 const StatusItem = struct {
     index: u8,
@@ -132,6 +130,82 @@ fn getTerminalWidth() u16 {
     const rc: i32 = std.c.ioctl(1, TIOCGWINSZ, @intFromPtr(&wsz));
     if (rc == 0 and wsz.col > 0) return wsz.col;
     return 30;
+}
+
+const Terminal = struct {
+    original: ?std.posix.termios,
+    active: bool,
+
+    fn enter(io: std.Io) Terminal {
+        const original = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch {
+            return .{ .original = null, .active = false };
+        };
+
+        var raw = original;
+        raw.iflag.BRKINT = false;
+        raw.iflag.ICRNL = false;
+        raw.iflag.INPCK = false;
+        raw.iflag.ISTRIP = false;
+        raw.iflag.IXON = false;
+        raw.cflag.CSIZE = .CS8;
+        raw.cflag.CREAD = true;
+        raw.lflag.ECHO = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.IEXTEN = false;
+        raw.lflag.ISIG = false;
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+
+        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw) catch {
+            return .{ .original = null, .active = false };
+        };
+
+        writeOut(io, "\x1b[?1049h\x1b[?25l") catch {};
+        return .{ .original = original, .active = true };
+    }
+
+    fn leave(self: *const Terminal, io: std.Io) void {
+        if (!self.active) return;
+        writeOut(io, "\x1b[?25h\x1b[?1049l") catch {};
+        if (self.original) |original| {
+            std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, original) catch {};
+        }
+    }
+};
+
+// Wait for the refresh interval while watching stdin. Returns true when the
+// user asks to quit with q, Q, or Ctrl+C.
+fn waitForQuit(interval_ms: u32) bool {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = std.posix.STDIN_FILENO,
+        .events = @intCast(std.posix.POLL.IN),
+        .revents = 0,
+    }};
+
+    const timeout: i32 = @intCast(@min(interval_ms, std.math.maxInt(i32)));
+    const ready = std.posix.poll(&fds, timeout) catch return false;
+    if (ready == 0) return false;
+
+    const hung_up = fds[0].revents & @as(i16, std.posix.POLL.HUP) != 0;
+    const readable = fds[0].revents & @as(i16, std.posix.POLL.IN) != 0;
+    if (hung_up) return true;
+    if (!readable) return false;
+
+    var buf: [16]u8 = undefined;
+    const len = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return false;
+    if (len == 0) return true;
+
+    for (buf[0..len]) |ch| {
+        if (ch == 'q' or ch == 'Q' or ch == 3) return true;
+    }
+    return false;
+}
+
+fn waitOrQuit(io: std.Io, interactive: bool, timeout_ms: u32) bool {
+    if (interactive) return waitForQuit(timeout_ms);
+
+    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(@as(i96, @intCast(@as(u64, timeout_ms) * std.time.ns_per_ms))), std.Io.Clock.awake) catch {};
+    return false;
 }
 
 fn getBranchName(allocator: Allocator, io: std.Io) []const u8 {
@@ -450,22 +524,21 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const arg = std.mem.sliceTo(args[i], 0);
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            var ver_buf: [32]u8 = undefined;
-            const ver = std.fmt.bufPrint(&ver_buf, "{}.{}.{}", .{ version.major, version.minor, version.patch }) catch unreachable;
-
             var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "quick-diff v{s}\n", .{ver}) catch unreachable;
+            const msg = std.fmt.bufPrint(&buf, "minidiff v{s}\n", .{version}) catch unreachable;
             writeOut(io, msg) catch {};
 
-            const msg2 = std.fmt.bufPrint(&buf, "Usage: quick-diff [-s SECONDS] [-h]\n", .{}) catch unreachable;
+            const msg2 = std.fmt.bufPrint(&buf, "Usage: minidiff [-s SECONDS] [-h]\n", .{}) catch unreachable;
             writeOut(io, msg2) catch {};
 
             const msg3 = std.fmt.bufPrint(&buf, "  -s, --interval SECONDS  Refresh interval (default: 1)\n", .{}) catch unreachable;
             writeOut(io, msg3) catch {};
 
             const msg4 = std.fmt.bufPrint(&buf, "  -h, --help              Show this help\n", .{}) catch unreachable;
-
             writeOut(io, msg4) catch {};
+
+            const msg5 = std.fmt.bufPrint(&buf, "  q                       Quit\n", .{}) catch unreachable;
+            writeOut(io, msg5) catch {};
             return;
         }
         if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--interval")) {
@@ -491,6 +564,9 @@ pub fn main(init: std.process.Init) !void {
     var line_buf: [512]u8 = undefined;
     var header_buf: [1024]u8 = undefined;
 
+    var terminal = Terminal.enter(io);
+    defer terminal.leave(io);
+
     while (true) {
         // Clear screen for TTY
         const clear_buf: []const u8 = "\x1b[2J\x1b[H";
@@ -502,7 +578,7 @@ pub fn main(init: std.process.Init) !void {
         if (status_raw.len == 0 and branch.len == 0) {
             const msg = "not a git repository\n";
             writeOut(io, msg) catch {};
-            std.Io.sleep(io, std.Io.Duration.fromNanoseconds(1 * std.time.ns_per_s), std.Io.Clock.awake) catch {};
+            if (waitOrQuit(io, terminal.active, 1000)) break;
             continue;
         }
 
@@ -692,6 +768,6 @@ pub fn main(init: std.process.Init) !void {
         for (items) |item| allocator.free(item.path);
         allocator.free(items);
 
-        std.Io.sleep(io, std.Io.Duration.fromNanoseconds(@as(i96, @intCast(@as(u64, interval_ms) * std.time.ns_per_ms))), std.Io.Clock.awake) catch {};
+        if (waitOrQuit(io, terminal.active, interval_ms)) break;
     }
 }
