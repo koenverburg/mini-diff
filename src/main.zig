@@ -501,6 +501,14 @@ fn writeHeaderLine(buf: []u8, content: []const u8, folder: []const u8, stats: []
     appendStr(buf, &offset, ansi_dim);
 
     const line_width = @max(width, 6);
+
+    // Keep one column of breathing room between the content and the fill line.
+    if (used < line_width and offset + 1 + hbar.len + 1 + ansi_reset.len <= buf.len) {
+        buf[offset] = ' ';
+        offset += 1;
+        used += 1;
+    }
+
     while (used < line_width and offset + hbar.len + 1 + ansi_reset.len <= buf.len) : (used += 1) {
         appendStr(buf, &offset, hbar);
     }
